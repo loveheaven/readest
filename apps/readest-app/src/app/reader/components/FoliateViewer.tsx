@@ -39,6 +39,7 @@ import {
 } from '@/utils/style';
 import { mountAdditionalFonts, mountCustomFont } from '@/styles/fonts';
 import { layoutWarichu, relayoutWarichu } from '@/utils/warichu';
+import { layoutRubyOverlay, removeRubyOverlay } from '@/utils/rubyOverlay';
 import { getBookDirFromLanguage, getBookDirFromWritingMode } from '@/utils/book';
 import { getIndexFromCfi } from '@/utils/cfi';
 import { useUICSS } from '@/hooks/useUICSS';
@@ -339,6 +340,7 @@ const FoliateViewer: React.FC<{
     setLoading(false);
     // Layout/relayout warichu after paginator has set column-width via columnize()
     const contents = viewRef.current?.renderer?.getContents?.() || [];
+    const viewSettings = getViewSettings(bookKey);
     for (const { doc } of contents) {
       if (doc) {
         const hasPending = doc.querySelectorAll('.warichu-pending').length > 0;
@@ -348,9 +350,20 @@ const FoliateViewer: React.FC<{
         } else if (hasExisting) {
           relayoutWarichu(doc);
         }
+        // Classic mode: re-create ruby annotation overlays
+        if (viewSettings?.classicMode) {
+          try {
+            layoutRubyOverlay(doc);
+          } catch (e) {
+            console.error('[rubyOverlay] error:', e);
+          }
+        } else {
+          removeRubyOverlay(doc);
+        }
       }
     }
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey]);
 
   const docRelocateHandler = (event: Event) => {
     const detail = (event as CustomEvent).detail;

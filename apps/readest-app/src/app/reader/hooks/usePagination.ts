@@ -58,7 +58,7 @@ export const viewPagination = (
 ) => {
   if (!view || !viewSettings) return;
   const renderer = view.renderer;
-  if (viewSettings.rtl) {
+  if (viewSettings.rtl || viewSettings.classicMode) {
     side = swapLeftRight(side);
   }
   if (renderer.scrolled) {

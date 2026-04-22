@@ -276,6 +276,10 @@ export interface ViewConfig {
   readingRulerPosition: number;
   readingRulerOpacity: number;
   readingRulerColor: ReadingRulerColor;
+
+  classicMode: boolean;
+  classicBorderColor: string;
+  classicRuleWidth: number;
 }
 
 export interface TTSConfig {

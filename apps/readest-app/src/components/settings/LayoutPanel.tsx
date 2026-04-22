@@ -70,6 +70,9 @@ const LayoutPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRese
   const [useBookLayout, setUseBookLayout] = useState(viewSettings.useBookLayout);
   const [doubleBorder, setDoubleBorder] = useState(viewSettings.doubleBorder);
   const [borderColor, setBorderColor] = useState(viewSettings.borderColor);
+  const [classicMode, setClassicMode] = useState(viewSettings.classicMode);
+  const [classicBorderColor, setClassicBorderColor] = useState(viewSettings.classicBorderColor);
+  const [classicRuleWidth, setClassicRuleWidth] = useState(viewSettings.classicRuleWidth);
   const [showHeader, setShowHeader] = useState(viewSettings.showHeader);
   const [showFooter, setShowFooter] = useState(viewSettings.showFooter);
   const [showRemainingTime, setShowRemainingTime] = useState(viewSettings.showRemainingTime);
@@ -114,6 +117,9 @@ const LayoutPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRese
       useBookLayout: setUseBookLayout,
       doubleBorder: setDoubleBorder,
       borderColor: setBorderColor,
+      classicMode: setClassicMode,
+      classicBorderColor: setClassicBorderColor,
+      classicRuleWidth: setClassicRuleWidth,
       showHeader: setShowHeader,
       showFooter: setShowFooter,
       showRemainingTime: setShowRemainingTime,
@@ -337,6 +343,51 @@ const LayoutPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRese
   }, [borderColor]);
 
   useEffect(() => {
+    if (classicMode === viewSettings.classicMode) return;
+    saveViewSettings(envConfig, bookKey, 'classicMode', classicMode, false, false);
+    if (classicMode) {
+      // Force vertical writing mode when classic mode is enabled
+      if (!viewSettings.vertical) {
+        viewSettings.vertical = true;
+        setWritingMode('vertical-rl');
+        saveViewSettings(envConfig, bookKey, 'writingMode', 'vertical-rl', true).then(() => {
+          if (view) {
+            const newViewSettings = getViewSettings(bookKey)!;
+            view.renderer.setStyles?.(getStyles(newViewSettings));
+            view.book.dir = getBookDirFromWritingMode('vertical-rl');
+          }
+          recreateViewer(envConfig, bookKey);
+        });
+      } else {
+        // Already vertical, just re-apply styles to add column-rule etc.
+        if (view) {
+          const newViewSettings = getViewSettings(bookKey)!;
+          view.renderer.setStyles?.(getStyles(newViewSettings));
+        }
+      }
+    } else {
+      // Classic mode disabled, re-apply styles to remove column-rule
+      if (view) {
+        const newViewSettings = getViewSettings(bookKey)!;
+        view.renderer.setStyles?.(getStyles(newViewSettings));
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classicMode]);
+
+  useEffect(() => {
+    if (classicBorderColor === viewSettings.classicBorderColor) return;
+    saveViewSettings(envConfig, bookKey, 'classicBorderColor', classicBorderColor, false, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classicBorderColor]);
+
+  useEffect(() => {
+    if (classicRuleWidth === viewSettings.classicRuleWidth) return;
+    saveViewSettings(envConfig, bookKey, 'classicRuleWidth', classicRuleWidth, false, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classicRuleWidth]);
+
+  useEffect(() => {
     saveViewSettings(envConfig, bookKey, 'showRemainingTime', showRemainingTime, false, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showRemainingTime]);
@@ -508,6 +559,56 @@ const LayoutPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterRese
               ></button>
             </div>
           </SettingsRow>
+        </BoxedList>
+      )}
+
+      {mightBeRTLBook && (
+        <BoxedList title={_('Classic Mode')} data-setting-id='settings.layout.classicMode'>
+          <SettingsSwitchRow
+            label={_('Classic Book Style')}
+            checked={classicMode}
+            onChange={() => setClassicMode(!classicMode)}
+          />
+          {classicMode && (
+            <>
+              <SettingsRow label={_('Border Color')}>
+                <div className='flex gap-4'>
+                  <button
+                    title={_('Brown')}
+                    className={`btn btn-circle btn-sm hover:opacity-80 ${classicBorderColor === '#8B4513' ? 'ring-2 ring-offset-2' : ''}`}
+                    style={{ backgroundColor: '#8B4513' }}
+                    onClick={() => setClassicBorderColor('#8B4513')}
+                  ></button>
+                  <button
+                    title={_('Red')}
+                    className={`btn btn-circle btn-sm hover:opacity-80 ${classicBorderColor === '#8B0000' ? 'ring-2 ring-offset-2' : ''}`}
+                    style={{ backgroundColor: '#8B0000' }}
+                    onClick={() => setClassicBorderColor('#8B0000')}
+                  ></button>
+                  <button
+                    title={_('Black')}
+                    className={`btn btn-circle btn-sm bg-black/70 hover:bg-black ${classicBorderColor === '#333333' ? 'ring-2 ring-offset-2' : ''}`}
+                    onClick={() => setClassicBorderColor('#333333')}
+                  ></button>
+                  <button
+                    title={_('Blue')}
+                    className={`btn btn-circle btn-sm hover:opacity-80 ${classicBorderColor === '#1a3a5c' ? 'ring-2 ring-offset-2' : ''}`}
+                    style={{ backgroundColor: '#1a3a5c' }}
+                    onClick={() => setClassicBorderColor('#1a3a5c')}
+                  ></button>
+                </div>
+              </SettingsRow>
+              <NumberInput
+                label={_('Rule Line Width')}
+                value={classicRuleWidth}
+                onChange={setClassicRuleWidth}
+                min={0}
+                max={20}
+                step={1}
+                data-setting-id='settings.layout.classicRuleWidth'
+              />
+            </>
+          )}
         </BoxedList>
       )}
 

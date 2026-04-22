@@ -628,6 +628,39 @@ const getRubyStyles = () => `
   }
 `;
 
+const getClassicModeStyles = () => `
+  html, body {
+    writing-mode: vertical-rl !important;
+  }
+  body, p, div, h1, h2, h3, h4, h5, h6, blockquote, section,
+  article, aside, nav, header, footer, main, figure, figcaption,
+  ul, ol, li, dl, dt, dd, pre, table, tr, td, th {
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    line-height: 2.0 !important;
+  }
+  /* Ruby: hide rt so main text lays out without ruby affecting line width.
+     Ruby annotations will be re-added as absolute-positioned overlays by JS
+     after the page stabilizes. */
+  rt {
+    display: none !important;
+  }
+  rp {
+    display: none !important;
+  }
+  /* Text emphasis (着重号) widens the line in vertical mode.
+     Disable it; use underline as a fallback visual cue instead. */
+  .em_bullet, [style*="text-emphasis"], [style*="-webkit-text-emphasis"] {
+    -webkit-text-emphasis: none !important;
+    text-emphasis: none !important;
+    text-decoration: underline !important;
+    text-decoration-thickness: 2px !important;
+    text-underline-offset: 0.15em !important;
+  }
+`;
+
 export interface ThemeCode {
   bg: string;
   fg: string;
@@ -725,8 +758,9 @@ export const getStyles = (viewSettings: ViewSettings, themeCode?: ThemeCode) => 
   const translationStyles = getTranslationStyles(viewSettings.showTranslateSource!);
   const warichuStyles = getWarichuStyles();
   const rubyStyles = getRubyStyles();
+  const classicModeStyles = viewSettings.classicMode ? getClassicModeStyles() : '';
   const userStylesheet = viewSettings.userStylesheet!;
-  return `${pageLayoutStyles}\n${paragraphLayoutStyles}\n${fontStyles}\n${colorStyles}\n${translationStyles}\n${warichuStyles}\n${rubyStyles}\n${userStylesheet}`;
+  return `${pageLayoutStyles}\n${paragraphLayoutStyles}\n${fontStyles}\n${colorStyles}\n${translationStyles}\n${warichuStyles}\n${rubyStyles}\n${classicModeStyles}\n${userStylesheet}`;
 };
 
 export const applyTranslationStyle = (viewSettings: ViewSettings) => {

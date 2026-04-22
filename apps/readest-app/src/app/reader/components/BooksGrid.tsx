@@ -23,6 +23,7 @@ import FootnotePopup from './FootnotePopup';
 import HintInfo from './HintInfo';
 import ReadingRuler from './ReadingRuler';
 import DoubleBorder from './DoubleBorder';
+import ClassicModeOverlay from './ClassicModeOverlay';
 
 interface BooksGridProps {
   bookKeys: string[];
@@ -128,6 +129,16 @@ const BooksGrid: React.FC<BooksGridProps> = ({ bookKeys, onCloseBook, onGoToLibr
               onGoToLibrary={onGoToLibrary}
               onDropdownOpenChange={(isOpen) => setDropdownOpenBook(isOpen ? bookKey : '')}
             />
+            {viewSettings.classicMode && !viewSettings.scrolled && (
+              <ClassicModeOverlay
+                bookKey={bookKey}
+                borderColor={viewSettings.classicBorderColor}
+                ruleWidth={viewSettings.classicRuleWidth}
+                insets={viewInsets}
+                showHeader={showHeader}
+                showFooter={showFooter}
+              />
+            )}
             <FoliateViewer
               key={viewerKey}
               bookKey={bookKey}
