@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { WebAppService } from '@/services/webAppService';
+import { Book } from '@/types/book';
 import { fsTests } from './suites/fs-tests';
 import { libraryTests } from './suites/library-tests';
 import { bookTests } from './suites/book-tests';
@@ -64,4 +65,46 @@ describe('WebAppService', () => {
   fsTests(() => service);
   libraryTests(() => service);
   bookTests(() => service, getBookFile);
+
+  // JSON-backend-only library assertions. These probe the `library.json`
+  // sidecar that the legacy `JsonLibraryRepository` writes; SQLite-backed
+  // hosts (NodeAppService / NativeAppService) deliberately do not produce
+  // these files, so the equivalent assertions must not run there.
+  describe('Library (JSON sidecar specifics)', () => {
+    const makeBook = (overrides: Partial<Book> = {}): Book => ({
+      hash: 'abc123',
+      format: 'EPUB',
+      title: 'Test Book',
+      author: 'Test Author',
+      createdAt: 1000,
+      updatedAt: 2000,
+      ...overrides,
+    });
+
+    it('should strip coverImageUrl from the on-disk library.json', async () => {
+      const book = makeBook({ coverImageUrl: 'http://example.com/cover.jpg' });
+      await service.saveLibraryBooks([book]);
+
+      const raw = (await service.readFile('library.json', 'Books', 'text')) as string;
+      const parsed = JSON.parse(raw) as Book[];
+      expect(parsed[0]!.coverImageUrl).toBeUndefined();
+    });
+
+    it('should create library.json.bak alongside library.json', async () => {
+      await service.saveLibraryBooks([makeBook()]);
+
+      expect(await service.exists('library.json', 'Books')).toBe(true);
+      expect(await service.exists('library.json.bak', 'Books')).toBe(true);
+    });
+
+    it('should return empty array when both main and backup are corrupted', async () => {
+      await service.saveLibraryBooks([makeBook()]);
+
+      await service.writeFile('library.json', 'Books', 'bad');
+      await service.writeFile('library.json.bak', 'Books', 'bad');
+
+      const loaded = await service.loadLibraryBooks();
+      expect(loaded).toEqual([]);
+    });
+  });
 });

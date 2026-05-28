@@ -330,7 +330,8 @@ export default {
     await db.exec('PRAGMA temp_store = MEMORY');
 
     // Sanity check: both backends agree on row count.
-    const sqliteCount = (await db.prepare('SELECT count(*) AS c FROM books').get()) as {
+    const countStmt = await db.prepare('SELECT count(*) AS c FROM books');
+    const sqliteCount = (await countStmt.get()) as {
       c: number;
     };
     const jsonCount = jsonLoadAll(jsonH.rootDir).length;

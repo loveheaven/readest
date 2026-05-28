@@ -253,8 +253,10 @@ function rowToNav(row: BookNavRow): BookNav | null {
  * them in the JSON blob would mean every UPSERT_CONFIG_SQL also rewrites
  * every annotation, defeating the relational split.
  *
- * The sidecar config.json on disk DOES still inline booknotes — that's
- * the on-disk format WebDAV / backup / Foliate import all expect.
+ * When a sidecar config.json is materialised on demand
+ * (materializeBookConfigSidecar), the booknotes are re-attached so the
+ * resulting file matches the legacy on-disk format that backup /
+ * Foliate-import consumers expect.
  */
 function configBodyForJson(config: BookConfig): Omit<BookConfig, 'booknotes'> {
   // Spread copies the rest of the fields without mutating the caller's
@@ -416,29 +418,35 @@ function rowToBook(row: BookRow): Book {
 /**
  * SQLite-backed library backend.
  *
- * Storage model:
+ * Storage model (SQLite-only on the hot path):
  *   - books table replaces Books/library.json (single UPDATE per progress
  *     autosave; bench shows ~83× progress speedup, ~19× batch import).
  *   - book_configs + book_notes tables replace Books/<hash>/config.json
- *     for hot reads/writes. The on-disk sidecar config.json is still
- *     written byte-identically on every save so backupService, WebDAVSync
- *     and importBook's mergeBooks dedup path keep working unchanged.
+ *     entirely on hot reads/writes. The on-disk sidecar is NOT written
+ *     by saveBookConfig — autosave fires every ~2s while the user reads,
+ *     and pairing every UPSERT with an `fs.writeFile('config.json')`
+ *     would re-introduce the per-book file-IO cost SQLite was meant to
+ *     replace. Instead, the sidecar is materialised on demand by
+ *     materializeBookConfigSidecar() — see below.
  *   - book_navs replaces Books/<hash>/nav.json. Nav is a derived cache
- *     (computeBookNav rebuilds on miss), so this is structural rather
- *     than performance-driven; the sidecar nav.json is still mirrored
- *     on save for parity with the config path and to keep the on-disk
- *     library inspectable / portable.
+ *     (computeBookNav rebuilds on miss). saveBookNav() is also SQLite
+ *     only; the legacy nav.json sidecar is read once during bootstrap
+ *     for upgrade compatibility, then never written again.
  *
- * Why keep sidecars?
- *   - backupService.exportLibrary scans zip entries for `<hash>/config.json`
- *     literal filenames; making it DB-aware would change the backup zip
- *     format and break older app versions trying to restore.
- *   - WebDAVSync's wire format IS config.json — there's no SQLite-aware
- *     server protocol to migrate to.
- *   - bookService.importBook's mergeBooks reads peer
- *     <oldHash>/config.json directly via fs.readFile to merge booknotes
- *     across renamed-hash imports; that call site bypasses the repo
- *     abstraction by design.
+ * Sidecar materialisation (export-only path):
+ *
+ *   - materializeBookConfigSidecar(book) reconstructs the on-disk
+ *     Books/<hash>/config.json byte-for-byte from the canonical SQLite
+ *     state. backupService.exportLibrary calls it just before zipping
+ *     a book's directory so the backup format keeps producing the same
+ *     entries older app versions expect to restore.
+ *   - WebDAVSync push/pull operates on in-memory BookConfig objects
+ *     (no fs roundtrip), so it doesn't need a physical sidecar. The
+ *     wire format (the bytes of "config.json" at the WebDAV path) is
+ *     decoupled from the local on-disk file.
+ *   - bookService.importBook's dedup path used to read peer
+ *     <oldHash>/config.json directly; it now goes through the repo's
+ *     loadBookConfig instead, so it sees SQLite-canonical state.
  *
  * First-launch behaviour:
  *
@@ -618,25 +626,25 @@ export class SqliteLibraryRepository implements LibraryRepository {
   // -------------------------------------------------------------------------
   // BookConfig + BookNotes
   //
-  // Storage model: SQLite is the source of truth. The on-disk sidecar
-  // Books/<hash>/config.json is still written on every save so that:
-  //   1. backupService.exportLibrary keeps producing the existing zip
-  //      layout that older app versions / users restoring from backup
-  //      can still consume.
-  //   2. WebDAVSync.pushBookConfig / pullBookConfig keep round-tripping
-  //      the same files the protocol already understands (the line
-  //      format IS config.json — there's no "WebDAV reads SQLite" path).
-  //   3. importBook's mergeBooks dedup path reads peer <oldHash>/config.json
-  //      directly via fs.readFile — that call site bypasses the repo
-  //      abstraction by design.
+  // Storage model: SQLite is the SOLE source of truth on the hot path.
+  // saveBookConfig() does not write the legacy Books/<hash>/config.json
+  // sidecar — autosave fires every ~2s, and pairing each UPSERT with a
+  // file write would defeat the IO win SQLite was meant to deliver.
   //
-  // The sidecar is a byte-identical mirror of what the JSON repo would
-  // have written for the same input — that's what guarantees no
-  // observable difference for those three external consumers.
+  // The sidecar is materialised on demand instead:
+  //   - backupService.exportLibrary calls materializeBookConfigSidecar
+  //     just before zipping each book directory, so the backup format
+  //     stays compatible with older versions that restore from disk.
+  //   - WebDAVSync push/pull works on in-memory BookConfig objects and
+  //     doesn't read the disk sidecar at all.
+  //   - importBook's mergeBooks dedup path goes through this repo's
+  //     loadBookConfig (canonical SQLite state) instead of reading
+  //     <oldHash>/config.json directly.
   //
   // First-launch seeding: if book_configs has no row for `book.hash`
   // and the legacy sidecar exists, we read it once and INSERT into
-  // SQLite. Idempotent (PK conflict on re-seed is a no-op).
+  // SQLite. Idempotent (PK conflict on re-seed is a no-op). After this
+  // one-time bootstrap the sidecar is no longer consulted.
   // -------------------------------------------------------------------------
 
   async loadBookConfig(book: Book, settings: SystemSettings): Promise<BookConfig> {
@@ -685,26 +693,12 @@ export class SqliteLibraryRepository implements LibraryRepository {
   }
 
   async saveBookConfig(book: Book, config: BookConfig, settings?: SystemSettings): Promise<void> {
-    // 1) Compute the on-disk sidecar payload first. This must be
-    //    byte-identical to what JsonLibraryRepository would have
-    //    produced for the same input, otherwise WebDAV / backup
-    //    consumers see a behaviour change.
-    let sidecarPayload: string;
-    if (settings) {
-      const globalViewSettings = {
-        ...settings.globalViewSettings,
-        ...(FIXED_LAYOUT_FORMATS.has(book.format) ? DEFAULT_FIXED_LAYOUT_VIEW_SETTINGS : {}),
-      };
-      sidecarPayload = serializeConfig(config, globalViewSettings, DEFAULT_BOOK_SEARCH_CONFIG);
-    } else {
-      sidecarPayload = serializeRawConfig(config);
-    }
-
-    // 2) Persist to SQLite. The config_json column stores the SAME
-    //    serialised body as the sidecar, MINUS booknotes (those are
-    //    relational rows). On read we re-attach them; on write we
-    //    re-inline them into the sidecar via the payload above. This
-    //    keeps the on-disk format unchanged.
+    // The config_json column stores the BookConfig body MINUS booknotes;
+    // the booknotes go into the relational book_notes table. When
+    // settings is supplied we compress the body against globalViewSettings
+    // (matches the legacy sidecar contract); without settings we write
+    // the raw shape (used by WebDAV pull / importBook config-migration
+    // / backup restore, which already operate on raw payloads).
     let configJsonForDb: string;
     if (settings) {
       const globalViewSettings = {
@@ -735,12 +729,123 @@ export class SqliteLibraryRepository implements LibraryRepository {
         await db.execute(UPSERT_NOTE_SQL, noteToParams(book.hash, note));
       }
     });
+  }
 
-    // 3) Write the sidecar. We do this AFTER SQLite to bias toward
-    //    "DB is leading source of truth" — if the sidecar write fails
-    //    (full disk, etc.), the next read will still return the
-    //    correct config, and the next save retries the sidecar.
-    await this.fs.writeFile(getConfigFilename(book), 'Books', sidecarPayload);
+  /**
+   * Reconstruct Books/<hash>/config.json from the canonical SQLite
+   * state and write it to disk. This is the export-time bridge: hot-path
+   * autosave does not write the sidecar, so backupService.exportLibrary
+   * (and any other future on-disk consumer) calls this just before
+   * scanning the per-book directory for entries to package.
+   *
+   * The output bytes are equivalent to what JsonLibraryRepository would
+   * have written for the same logical state in raw mode (no settings
+   * compression). Backups don't need view-settings stripping — the
+   * restore path re-reads them through deserializeConfig anyway, which
+   * tolerates unstripped payloads.
+   *
+   * No-op when the book has no config row yet (a brand-new import that
+   * was added but never opened): there's nothing to materialise, and
+   * an empty sidecar would just confuse the restore path.
+   */
+  async materializeBookConfigSidecar(book: Book): Promise<void> {
+    const result = await this.withDb(async (db) => {
+      const rows = await db.select<BookConfigRow>(
+        'SELECT * FROM book_configs WHERE book_hash = ? LIMIT 1',
+        [book.hash],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const noteRows = await db.select<BookNoteRow>(
+        'SELECT * FROM book_notes WHERE book_hash = ? ORDER BY updated_at DESC',
+        [book.hash],
+      );
+      return { row, noteRows };
+    });
+    if (!result) return;
+
+    // Parse the body we stored (already booknotes-free) and re-inline
+    // booknotes from the relational rows. The resulting object is what
+    // the legacy on-disk sidecar would have contained.
+    let body: Partial<BookConfig>;
+    try {
+      body = JSON.parse(result.row.config_json) as Partial<BookConfig>;
+    } catch {
+      // Corrupt stored JSON shouldn't happen under normal operation;
+      // fall back to a minimal envelope so backup still produces a file.
+      body = { updatedAt: result.row.updated_at };
+    }
+    const reconstructed: BookConfig = {
+      ...(body as BookConfig),
+      booknotes: result.noteRows.map(rowToNote),
+      updatedAt: body.updatedAt ?? result.row.updated_at,
+    };
+
+    await this.fs.writeFile(getConfigFilename(book), 'Books', serializeRawConfig(reconstructed));
+  }
+
+  /**
+   * Return the canonical BookConfig as a raw dictionary — the shape
+   * the legacy sidecar would have on disk (booknotes inlined, no
+   * globalViewSettings stripping). Used by import-time dedup in
+   * bookService.mergeBooks: when the SQLite backend is active the
+   * peer book's progress + booknotes live in SQLite, not in
+   * Books/<oldHash>/config.json, so the legacy "fs.readFile sidecar"
+   * read would return stale/missing data.
+   *
+   * Falls back to the legacy sidecar when no SQLite row exists yet
+   * (the lazy-bootstrap window): a book that's been added on disk but
+   * never opened still has its config.json but no book_configs row.
+   * Returning null here would silently drop that book's notes from
+   * the merge, so we read the sidecar directly in that path. We do
+   * NOT seed SQLite from this read — bootstrapBookConfigFromSidecar
+   * runs on first open and is the single owner of that migration.
+   *
+   * Returns null only when neither SQLite nor a sidecar holds data
+   * (a freshly-imported book that hasn't been opened, or a book whose
+   * sidecar is corrupt — both are treated as "no notes/progress to
+   * merge", matching the JSON backend's behaviour).
+   */
+  async loadBookConfigRaw(book: Book): Promise<Partial<BookConfig> | null> {
+    const result = await this.withDb(async (db) => {
+      const rows = await db.select<BookConfigRow>(
+        'SELECT * FROM book_configs WHERE book_hash = ? LIMIT 1',
+        [book.hash],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const noteRows = await db.select<BookNoteRow>(
+        'SELECT * FROM book_notes WHERE book_hash = ? ORDER BY updated_at DESC',
+        [book.hash],
+      );
+      return { row, noteRows };
+    });
+
+    if (result) {
+      let body: Partial<BookConfig>;
+      try {
+        body = JSON.parse(result.row.config_json) as Partial<BookConfig>;
+      } catch {
+        body = { updatedAt: result.row.updated_at };
+      }
+      return {
+        ...body,
+        booknotes: result.noteRows.map(rowToNote),
+        updatedAt: body.updatedAt ?? result.row.updated_at,
+      };
+    }
+
+    // SQLite has no row yet — this book hasn't been opened in the
+    // SQLite era. Fall back to the legacy sidecar so dedup still sees
+    // pre-migration progress + booknotes.
+    const path = getConfigFilename(book);
+    if (!(await this.fs.exists(path, 'Books'))) return null;
+    try {
+      const str = (await this.fs.readFile(path, 'Books', 'text')) as string;
+      return JSON.parse(str) as Partial<BookConfig>;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -814,17 +919,13 @@ export class SqliteLibraryRepository implements LibraryRepository {
   }
 
   async saveBookNav(book: Book, nav: BookNav): Promise<void> {
-    // SQLite is canonical, but mirror to the on-disk sidecar so external
-    // tooling and a hypothetical fallback to JsonLibraryRepository keep
-    // working. JSON.stringify(nav) here matches the legacy bookService
-    // saveBookNav byte-for-byte.
-    const sidecar = JSON.stringify(nav);
-
+    // SQLite is the sole source of truth — nav.json sidecar is no longer
+    // mirrored on save. Existing installs still benefit from the
+    // bootstrapBookNavFromSidecar path on first read, which seeds the
+    // table from any pre-existing on-disk cache.
     await this.withDb(async (db) => {
       await db.execute(UPSERT_NAV_SQL, navToParams(book.hash, nav, Date.now()));
     });
-
-    await this.fs.writeFile(getBookNavFilename(book), 'Books', sidecar);
   }
 
   /**

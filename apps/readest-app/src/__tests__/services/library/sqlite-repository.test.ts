@@ -316,7 +316,7 @@ class MockFs implements Partial<FileSystem> {
     return content;
   });
 
-  writeFile = vi.fn(async (path: string, base: BaseDir, content: string | Uint8Array) => {
+  writeFile = vi.fn(async (path: string, base: BaseDir, content: string | ArrayBuffer | File) => {
     if (typeof content !== 'string') return;
     this.files.set(`${base}/${path}`, content);
   });
@@ -330,7 +330,6 @@ class MockFs implements Partial<FileSystem> {
     async (): Promise<FileInfo> => ({
       isFile: true,
       isDirectory: false,
-      isSymlink: false,
       size: 0,
       mtime: null,
       atime: null,
@@ -543,7 +542,7 @@ describe('SqliteLibraryRepository', () => {
     }) as unknown as SystemSettings;
 
   const makeNote = (overrides: Partial<BookNote> & Pick<BookNote, 'id'>): BookNote => ({
-    type: 'highlight',
+    type: 'annotation',
     cfi: `epubcfi(/${overrides.id})`,
     note: '',
     createdAt: 1000,
@@ -559,7 +558,7 @@ describe('SqliteLibraryRepository', () => {
     expect(config.viewSettings?.scrolled).toBe(false); // rehydrated from globals
   });
 
-  it('saveBookConfig writes the SQLite row and a byte-identical sidecar', async () => {
+  it('saveBookConfig writes the SQLite row and does NOT mirror the sidecar', async () => {
     const book = makeBook({ hash: 'h1' });
     const config: BookConfig = {
       schemaVersion: 1,
@@ -590,12 +589,83 @@ describe('SqliteLibraryRepository', () => {
     expect(db.notes.get('h1::n1')?.note).toBe('why?');
     expect(db.notes.get('h1::n1')?.global_flag).toBe(0);
 
-    // Sidecar mirror: the on-disk file embeds booknotes inline so
-    // backup / WebDAV consumers see no behaviour change.
-    const sidecar = JSON.parse(fs.files.get('Books/h1/config.json')!) as BookConfig;
-    expect(sidecar.booknotes).toHaveLength(1);
-    expect(sidecar.booknotes![0]!.id).toBe('n1');
+    // Hot path is SQLite-only: no on-disk sidecar is written. Backup
+    // export goes through materializeBookConfigSidecar instead, which
+    // is verified by its own test below.
+    expect(fs.files.has('Books/h1/config.json')).toBe(false);
+  });
+
+  it('materializeBookConfigSidecar reconstructs the on-disk config.json from SQLite', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const config: BookConfig = {
+      schemaVersion: 1,
+      progress: [3, 100],
+      updatedAt: 1234,
+      viewSettings: { scrolled: true } as BookConfig['viewSettings'],
+      booknotes: [
+        makeNote({ id: 'n1', text: 'hi', note: 'why?', updatedAt: 200 }),
+        makeNote({ id: 'n2', text: 'bye', note: '!', updatedAt: 100 }),
+      ],
+    };
+    await repo.saveBookConfig(book, config, makeSettings());
+    expect(fs.files.has('Books/h1/config.json')).toBe(false);
+
+    await repo.materializeBookConfigSidecar(book);
+
+    // Sidecar was written: backup / Foliate-export consumers can now
+    // read the per-book directory and find the canonical payload.
+    const raw = fs.files.get('Books/h1/config.json');
+    expect(raw).toBeDefined();
+    const sidecar = JSON.parse(raw!) as BookConfig;
+    // Booknotes are re-inlined (relational rows merged back in,
+    // ORDER BY updated_at DESC).
+    expect(sidecar.booknotes?.map((n) => n.id)).toEqual(['n1', 'n2']);
+    // The body fields are preserved.
+    expect(sidecar.progress).toEqual([3, 100]);
     expect(sidecar.viewSettings?.scrolled).toBe(true);
+  });
+
+  it('materializeBookConfigSidecar is a no-op when no SQLite row exists', async () => {
+    const book = makeBook({ hash: 'h1' });
+    await repo.materializeBookConfigSidecar(book);
+    // Nothing to materialise → no file touched.
+    expect(fs.files.has('Books/h1/config.json')).toBe(false);
+  });
+
+  it('loadBookConfigRaw returns the SQLite-canonical payload with booknotes inlined', async () => {
+    const book = makeBook({ hash: 'h1' });
+    await repo.saveBookConfig(
+      book,
+      {
+        updatedAt: 99,
+        progress: [7, 42],
+        booknotes: [makeNote({ id: 'a' }), makeNote({ id: 'b' })],
+      } as BookConfig,
+      makeSettings(),
+    );
+
+    const raw = await repo.loadBookConfigRaw(book);
+    expect(raw?.progress).toEqual([7, 42]);
+    expect(raw?.booknotes?.map((n) => n.id).sort()).toEqual(['a', 'b']);
+  });
+
+  it('loadBookConfigRaw falls back to the legacy sidecar when no row exists', async () => {
+    const book = makeBook({ hash: 'h1' });
+    fs.files.set(
+      'Books/h1/config.json',
+      JSON.stringify({ progress: [5, 50], booknotes: [makeNote({ id: 'legacy' })] }),
+    );
+
+    const raw = await repo.loadBookConfigRaw(book);
+    expect(raw?.progress).toEqual([5, 50]);
+    expect(raw?.booknotes?.[0]?.id).toBe('legacy');
+    // Pure read — does NOT seed SQLite (that's bootstrapBookConfigFromSidecar's job).
+    expect(db.configs.has('h1')).toBe(false);
+  });
+
+  it('loadBookConfigRaw returns null when neither row nor sidecar exist', async () => {
+    const book = makeBook({ hash: 'h1' });
+    expect(await repo.loadBookConfigRaw(book)).toBeNull();
   });
 
   it('loadBookConfig re-attaches booknotes from book_notes', async () => {
@@ -703,7 +773,7 @@ describe('SqliteLibraryRepository — BookNav', () => {
   // real type to keep this test independent of the nav-module surface.
   const makeNav = (overrides: Partial<{ version: number }> = {}) => ({
     version: 3,
-    toc: [{ label: 'Chapter 1', href: 'c1.xhtml' }],
+    toc: [{ id: 0, index: 0, label: 'Chapter 1', href: 'c1.xhtml' }],
     sections: { 'c1.xhtml': { id: 'c1.xhtml', fragments: [] } },
     ...overrides,
   });
@@ -715,7 +785,7 @@ describe('SqliteLibraryRepository — BookNav', () => {
     expect(db.navs.size).toBe(0);
   });
 
-  it('saveBookNav writes the SQLite row and a byte-identical sidecar', async () => {
+  it('saveBookNav writes the SQLite row and does NOT mirror the sidecar', async () => {
     const book = makeBook({ hash: 'h1' });
     const nav = makeNav();
 
@@ -727,8 +797,10 @@ describe('SqliteLibraryRepository — BookNav', () => {
     expect(JSON.parse(row!.toc_json)).toEqual(nav.toc);
     expect(JSON.parse(row!.sections_json)).toEqual(nav.sections);
 
-    const sidecar = fs.files.get('Books/h1/nav.json');
-    expect(sidecar).toBe(JSON.stringify(nav));
+    // Hot path is SQLite-only — nav.json is no longer written. The
+    // legacy sidecar is still consulted ONCE by bootstrapBookNavFromSidecar
+    // for upgrade compatibility (see the bootstrap test below).
+    expect(fs.files.has('Books/h1/nav.json')).toBe(false);
   });
 
   it('loadBookNav reads from SQLite when the row exists', async () => {
@@ -774,13 +846,13 @@ describe('SqliteLibraryRepository — BookNav', () => {
     expect(db.navs.has('h1')).toBe(false);
   });
 
-  it('saveBookNav overwrites a previous row and sidecar', async () => {
+  it('saveBookNav overwrites a previous row', async () => {
     const book = makeBook({ hash: 'h1' });
     await repo.saveBookNav(book, makeNav({ version: 2 }));
     await repo.saveBookNav(book, makeNav({ version: 3 }));
 
     expect(db.navs.get('h1')?.version).toBe(3);
-    const sidecar = JSON.parse(fs.files.get('Books/h1/nav.json')!) as { version: number };
-    expect(sidecar.version).toBe(3);
+    // No sidecar mirror — SQLite is the sole source of truth.
+    expect(fs.files.has('Books/h1/nav.json')).toBe(false);
   });
 });

@@ -199,6 +199,14 @@ export interface AppService {
   saveBookConfig(book: Book, config: BookConfig, settings?: SystemSettings): Promise<void>;
   loadBookNav(book: Book): Promise<BookNav | null>;
   saveBookNav(book: Book, nav: BookNav): Promise<void>;
+  /**
+   * Re-materialise Books/<hash>/config.json from the canonical library
+   * store before an export-time consumer (backup zip writer, future
+   * Foliate exporter) reads the on-disk per-book directory. The SQLite
+   * backend keeps the sidecar lazy on the hot path; the JSON backend
+   * has nothing to do here.
+   */
+  materializeBookConfigSidecar(book: Book): Promise<void>;
   loadBookContent(book: Book): Promise<BookContent>;
   loadLibraryBooks(): Promise<Book[]>;
   saveLibraryBooks(books: Book[]): Promise<void>;

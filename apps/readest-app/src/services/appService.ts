@@ -286,6 +286,12 @@ export abstract class BaseAppService implements AppService {
   ): Promise<Book | null> {
     return BookSvc.importBook(this.fs, file, books, {
       saveBookConfig: this.saveBookConfig.bind(this),
+      // Bound to the active library repo so importBook's dedup path
+      // (mergeBooks + the metaHash-match config migration) reads peer
+      // books' progress/booknotes from the canonical store. Without
+      // this, the SQLite backend would still see stale/missing
+      // <oldHash>/config.json sidecars on disk.
+      loadBookConfigRaw: this.libraryRepo.loadBookConfigRaw.bind(this.libraryRepo),
       generateCoverImageUrl: this.generateCoverImageUrl.bind(this),
       ...options,
     });
@@ -433,6 +439,10 @@ export abstract class BaseAppService implements AppService {
 
   async saveBookNav(book: Book, nav: BookNav) {
     return this.libraryRepo.saveBookNav(book, nav);
+  }
+
+  async materializeBookConfigSidecar(book: Book): Promise<void> {
+    return this.libraryRepo.materializeBookConfigSidecar(book);
   }
 
   async loadLibraryBooks(): Promise<Book[]> {

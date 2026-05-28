@@ -276,6 +276,21 @@ async function addBackupEntriesToZip(
     console.warn('Skipping settings backup:', error);
   }
 
+  // Re-materialise each book's config.json from the canonical store
+  // before scanning the per-book directories. The SQLite backend keeps
+  // the sidecar lazy on the hot path (autosave only writes SQLite); a
+  // backup zip without these files would silently drop progress &
+  // booknotes for older versions doing on-disk restores. The JSON
+  // backend's implementation is a no-op so this loop is free for the
+  // legacy storage path.
+  for (const book of books) {
+    try {
+      await appService.materializeBookConfigSidecar(book);
+    } catch (error) {
+      console.warn(`Skipping sidecar materialisation for ${book.hash}:`, error);
+    }
+  }
+
   // Add all book files, skipping library metadata files
   const booksDir = await appService.resolveFilePath('', 'Books');
   const files = await appService.readDirectory(booksDir, 'None');
@@ -401,6 +416,12 @@ export async function restoreFromBackupZip(
     currentBooksMap.set(book.hash, book);
   }
 
+  // Loaded once and reused for every per-book config merge below.
+  // loadBookConfig requires SystemSettings to deserialise the stored
+  // body against globalViewSettings; restore happens at app boot, so
+  // this is the freshest view we have.
+  const settingsForMerge: SystemSettings = await appService.loadSettings();
+
   // Collect orphan hash directories: in zip but not in library.json
   const backupHashes = new Set(backupBooks.map((b) => b.hash));
   const orphanHashes = new Set<string>();
@@ -434,18 +455,23 @@ export async function restoreFromBackupZip(
         const data = await entry.getData!(new Uint8ArrayWriter());
 
         if (entry.filename.endsWith('/config.json')) {
-          // Merge config
+          // Merge against the canonical store (SQLite when available;
+          // the legacy sidecar otherwise). Reading from disk would miss
+          // unflushed in-memory state on the SQLite backend, since
+          // saveBookConfig no longer mirrors to the sidecar on the hot
+          // path.
           let currentConfig: Partial<BookConfig> = {};
           try {
-            const str = (await appService.readFile(entry.filename, 'Books', 'text')) as string;
-            currentConfig = JSON.parse(str);
+            currentConfig = await appService.loadBookConfig(existingBook, settingsForMerge);
           } catch {
-            /* use empty config if current doesn't exist */
+            /* use empty config if loading fails (corrupt row, etc.) */
           }
 
           const backupConfig: Partial<BookConfig> = JSON.parse(new TextDecoder().decode(data));
           const mergedConfig = mergeBookConfigs(currentConfig, backupConfig);
-          await appService.writeFile(entry.filename, 'Books', JSON.stringify(mergedConfig));
+          // Persist back through the repo so SQLite (or the JSON file)
+          // becomes the canonical merged state immediately.
+          await appService.saveBookConfig(existingBook, mergedConfig as BookConfig);
         } else {
           // Override book file and cover image
           await appService.writeFile(entry.filename, 'Books', data.buffer as ArrayBuffer);
@@ -466,7 +492,21 @@ export async function restoreFromBackupZip(
       }
       for (const entry of bookFileEntries) {
         const data = await entry.getData!(new Uint8ArrayWriter());
-        await appService.writeFile(entry.filename, 'Books', data.buffer as ArrayBuffer);
+        if (entry.filename.endsWith('/config.json')) {
+          // Funnel through the repo so SQLite gets seeded immediately
+          // instead of waiting for the lazy sidecar bootstrap on the
+          // first reader open.
+          try {
+            const parsed = JSON.parse(new TextDecoder().decode(data)) as BookConfig;
+            await appService.saveBookConfig(backupBook, parsed);
+          } catch {
+            // Fall back to a plain disk write so the legacy bootstrap
+            // path still picks it up on the next loadBookConfig.
+            await appService.writeFile(entry.filename, 'Books', data.buffer as ArrayBuffer);
+          }
+        } else {
+          await appService.writeFile(entry.filename, 'Books', data.buffer as ArrayBuffer);
+        }
       }
       currentBooks.push(backupBook);
       currentBooksMap.set(backupBook.hash, backupBook);

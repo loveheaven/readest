@@ -139,6 +139,18 @@ export async function updateCoverImage(
 // --- Book Merge ---
 
 /**
+ * Optional callback that returns the canonical raw BookConfig for a
+ * given book. When the SQLite library backend is active the on-disk
+ * Books/<hash>/config.json is no longer kept in sync on the hot path,
+ * so dedup must read through the repo to see the latest progress +
+ * booknotes. The caller (AppService.importBook) wires this to
+ * `LibraryRepository.loadBookConfigRaw`. When omitted, we fall back
+ * to reading the legacy sidecar — preserving the behaviour for unit
+ * tests and any future caller that doesn't have a repo handy.
+ */
+export type LoadBookConfigRawFn = (book: Book) => Promise<Partial<BookConfig> | null>;
+
+/**
  * Merge duplicate book entries that share the same metaHash and format as `book`.
  * Finds all other matching books in the array, selects the base config with the
  * largest reading progress page number, merges booknotes from all configs
@@ -152,6 +164,7 @@ export async function mergeBooks(
   books: Book[],
   book: Book,
   lookupIndex?: BookLookupIndex,
+  loadBookConfigRaw?: LoadBookConfigRawFn,
 ): Promise<string | undefined> {
   if (!book.metaHash) return undefined;
 
@@ -167,13 +180,26 @@ export async function mergeBooks(
   const allCandidates = [book, ...duplicates];
   const configs: Partial<BookConfig>[] = [];
   for (const candidate of allCandidates) {
-    const configPath = getConfigFilename(candidate);
-    if (await fs.exists(configPath, 'Books')) {
+    if (loadBookConfigRaw) {
+      // Repo-backed read: works for both backends, and for SQLite it
+      // returns the canonical (booknotes-inlined) shape from the DB.
       try {
-        const str = (await fs.readFile(configPath, 'Books', 'text')) as string;
-        configs.push(JSON.parse(str));
+        const cfg = await loadBookConfigRaw(candidate);
+        if (cfg) configs.push(cfg);
       } catch {
-        /* ignore corrupt configs */
+        /* ignore — same tolerance as the legacy fs branch below */
+      }
+    } else {
+      // Legacy fallback: only used by callers that haven't been wired
+      // through AppService (tests today; nothing in production).
+      const configPath = getConfigFilename(candidate);
+      if (await fs.exists(configPath, 'Books')) {
+        try {
+          const str = (await fs.readFile(configPath, 'Books', 'text')) as string;
+          configs.push(JSON.parse(str));
+        } catch {
+          /* ignore corrupt configs */
+        }
       }
     }
   }
@@ -220,6 +246,14 @@ export async function mergeBooks(
  */
 export interface ImportBookInternalOptions extends ImportBookOptions {
   saveBookConfig: (book: Book, config: BookConfig) => Promise<void>;
+  /**
+   * Repo-backed reader for the canonical raw BookConfig of a peer
+   * book. Required for the dedup path to work correctly under the
+   * SQLite backend (where the legacy sidecar is no longer kept fresh).
+   * AppService wires this to `LibraryRepository.loadBookConfigRaw`;
+   * tests may omit it and accept the legacy fs.readFile fallback.
+   */
+  loadBookConfigRaw?: LoadBookConfigRawFn;
   generateCoverImageUrl: (book: Book) => Promise<string>;
 }
 
@@ -237,6 +271,7 @@ export async function importBook(
 ): Promise<Book | null> {
   const {
     saveBookConfig: saveBookConfigFn,
+    loadBookConfigRaw: loadBookConfigRawFn,
     generateCoverImageUrl: generateCoverImageUrlFn,
     saveBook = true,
     saveCover = true,
@@ -323,7 +358,13 @@ export async function importBook(
         }
       }
       if (existingBook) {
-        bestConfigData = await mergeBooks(fs, books, existingBook, lookupIndex);
+        bestConfigData = await mergeBooks(
+          fs,
+          books,
+          existingBook,
+          lookupIndex,
+          loadBookConfigRawFn,
+        );
       }
     }
 
@@ -432,21 +473,43 @@ export async function importBook(
         }
       }
     } else if (metaHashMatch && oldBookDir && oldBookDir !== getDir(book)) {
-      // Migrate config from old directory to new directory, updating bookHash and metaHash
-      // Use aggregated best config when available from deduplication
+      // Migrate config from old directory to new directory, updating
+      // bookHash and metaHash. We persist via saveBookConfigFn so the
+      // SQLite backend gets the row written too (the legacy
+      // fs.writeFile path would only update the on-disk sidecar, which
+      // is no longer the source of truth on the hot path).
       if (bestConfigData) {
         const config: Partial<BookConfig> = JSON.parse(bestConfigData);
         config.bookHash = hash;
         config.metaHash = metaHash;
-        await fs.writeFile(getConfigFilename(book), 'Books', serializeRawConfig(config));
+        await saveBookConfigFn(book, config as BookConfig);
       } else {
-        const oldConfigPath = `${oldBookDir}/config.json`;
-        if (await fs.exists(oldConfigPath, 'Books')) {
-          const configData = (await fs.readFile(oldConfigPath, 'Books', 'text')) as string;
-          const config: Partial<BookConfig> = JSON.parse(configData);
-          config.bookHash = hash;
-          config.metaHash = metaHash;
-          await fs.writeFile(getConfigFilename(book), 'Books', serializeRawConfig(config));
+        // Try repo-backed read first (canonical SQLite state when the
+        // SQLite backend is active); fall back to the legacy sidecar
+        // for tests / brand-new books with only on-disk state.
+        let migrated: Partial<BookConfig> | null = null;
+        if (loadBookConfigRawFn && existingBook) {
+          try {
+            migrated = await loadBookConfigRawFn(existingBook);
+          } catch {
+            /* fall through to fs read */
+          }
+        }
+        if (!migrated) {
+          const oldConfigPath = `${oldBookDir}/config.json`;
+          if (await fs.exists(oldConfigPath, 'Books')) {
+            try {
+              const configData = (await fs.readFile(oldConfigPath, 'Books', 'text')) as string;
+              migrated = JSON.parse(configData) as Partial<BookConfig>;
+            } catch {
+              /* leave migrated null — fall through to default */
+            }
+          }
+        }
+        if (migrated) {
+          migrated.bookHash = hash;
+          migrated.metaHash = metaHash;
+          await saveBookConfigFn(book, migrated as BookConfig);
         } else {
           await saveBookConfigFn(book, INIT_BOOK_CONFIG);
         }
@@ -460,7 +523,7 @@ export async function importBook(
       const config: Partial<BookConfig> = JSON.parse(bestConfigData);
       config.bookHash = hash;
       config.metaHash = metaHash;
-      await fs.writeFile(getConfigFilename(book), 'Books', serializeRawConfig(config));
+      await saveBookConfigFn(book, config as BookConfig);
     }
 
     // update file links with url or path or content uri

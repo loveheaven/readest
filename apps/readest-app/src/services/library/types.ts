@@ -68,4 +68,29 @@ export interface LibraryRepository {
 
   /** Persist a freshly-computed navigation artifact for a book. */
   saveBookNav(book: Book, nav: BookNav): Promise<void>;
+
+  /**
+   * Reconstruct the on-disk Books/<hash>/config.json sidecar from the
+   * canonical store. The hot-path `saveBookConfig` no longer mirrors to
+   * disk, so export-time consumers (backup zip writer; future Foliate
+   * exporter) call this just before scanning the per-book directory
+   * for files to package.
+   *
+   * Implementations that already write the sidecar on every save (the
+   * legacy JSON repo) treat this as a no-op.
+   */
+  materializeBookConfigSidecar(book: Book): Promise<void>;
+
+  /**
+   * Return the canonical BookConfig in its raw on-disk shape — i.e.
+   * the same dictionary the legacy sidecar would contain, with
+   * booknotes inlined and viewSettings unstripped — without applying
+   * globalViewSettings. Used by import-time dedup paths (mergeBooks)
+   * that need to read peer books' progress + booknotes without caring
+   * about the active reader's view preferences.
+   *
+   * Returns null when the book has no stored config (a book that
+   * was added but never opened).
+   */
+  loadBookConfigRaw(book: Book): Promise<Partial<BookConfig> | null>;
 }

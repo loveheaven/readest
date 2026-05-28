@@ -2,6 +2,7 @@ import type { Book, BookConfig } from '@/types/book';
 import type { SystemSettings } from '@/types/settings';
 import type { FileSystem } from '@/types/system';
 import type { BookNav } from '@/services/nav';
+import { getConfigFilename } from '@/utils/book';
 
 import * as BookSvc from '@/services/bookService';
 import * as LibrarySvc from '@/services/libraryService';
@@ -61,5 +62,31 @@ export class JsonLibraryRepository implements LibraryRepository {
 
   saveBookNav(book: Book, nav: BookNav): Promise<void> {
     return BookSvc.saveBookNav(this.fs, book, nav);
+  }
+
+  /**
+   * No-op for the JSON backend: every saveBookConfig already writes the
+   * sidecar on disk, so there's nothing for export-time consumers to
+   * "materialise". Implemented to satisfy the interface contract.
+   */
+  async materializeBookConfigSidecar(_book: Book): Promise<void> {
+    // intentionally empty
+  }
+
+  /**
+   * Read the raw on-disk Books/<hash>/config.json — the canonical shape
+   * for this backend. Returns null when the sidecar is missing or
+   * unparseable (matches the behaviour mergeBooks already had when the
+   * file was absent or corrupt; corrupt configs were just skipped).
+   */
+  async loadBookConfigRaw(book: Book): Promise<Partial<BookConfig> | null> {
+    const path = getConfigFilename(book);
+    if (!(await this.fs.exists(path, 'Books'))) return null;
+    try {
+      const str = (await this.fs.readFile(path, 'Books', 'text')) as string;
+      return JSON.parse(str) as Partial<BookConfig>;
+    } catch {
+      return null;
+    }
   }
 }
