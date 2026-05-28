@@ -27,19 +27,18 @@ import { MigrationEntry } from '../migrate';
  *                            future use (e.g. last visited group, library
  *                            sort order) — empty in this migration.
  *
- * Out of scope (future migrations, separate PRs):
+ * Follow-up migrations (added in later versions of this same array):
  *
- *   - book_config         — Books/<hash>/config.json still lives on disk so
- *                            backups, WebDAV sync and Foliate import keep
- *                            working unchanged. The Sqlite repo still calls
- *                            into bookService for {load,save}BookConfig.
+ *   - v2 (2026053002_book_configs_and_notes) — book_configs + book_notes.
+ *     The on-disk Books/<hash>/config.json stays as a sidecar (backup,
+ *     WebDAV sync line format, Foliate import path and importBook's
+ *     mergeBooks dedup all read it directly), but SQLite becomes the
+ *     source of truth. See that migration's preamble for design notes.
  *
- *   - book_nav            — Books/<hash>/nav.json idem. Cached nav rebuild
- *                            cost is per-open, not hot enough to migrate yet.
- *
- *   - book_notes (FTS)    — full-text search across annotations becomes
- *                            trivial once booknotes live in their own table,
- *                            but that's a meaningful schema design effort.
+ *   - book_navs                — Books/<hash>/nav.json idem. Reserved
+ *                                for the next commit; the cache rebuild
+ *                                cost is per-open and behaves the same
+ *                                whether SQLite or JSON owns it.
  *
  * Indexing rationale:
  *
@@ -124,6 +123,115 @@ export const libraryMigrations: MigrationEntry[] = [
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+    `,
+  },
+
+  /**
+   * v2 — book_configs + book_notes.
+   *
+   * Why a JSON blob for the config body and a relational table for notes?
+   *
+   *   The BookConfig payload (location, viewSettings overrides,
+   *   searchConfig overrides, rsvpPosition, schemaVersion) goes through
+   *   `serializeConfig` (utils/serializer.ts) which diff-compresses
+   *   viewSettings / searchConfig against globalViewSettings before write
+   *   and re-hydrates them on read. Splitting that into relational
+   *   columns would force every viewSettings field addition to ship a
+   *   schema migration, and the diff round-trip is what the WebDAV sync
+   *   protocol's `compressConfig` payload depends on. Storing the
+   *   already-compressed JSON in a single column keeps the existing
+   *   serialiser semantics intact and means the on-disk sidecar is a
+   *   byte-identical mirror of `config_json` — backups, WebDAV pulls
+   *   and Foliate imports keep round-tripping the exact same payload.
+   *
+   *   Booknotes are different: cross-device sync, library-wide
+   *   annotation search and the "delete tombstone" path all want
+   *   indexed access by hash + updated_at + deleted_at. They live in
+   *   their own table with a composite PK (book_hash, id) and proper
+   *   indices. The sidecar config.json still inlines `booknotes` on
+   *   write (and is the source-of-truth for first-launch seeding) so
+   *   no external consumer breaks.
+   *
+   *   Hot-path columns (`progress_current/total`, `location`,
+   *   `last_synced_at_*`, `last_pushed_at_*`, `updated_at`) are
+   *   denormalised onto book_configs as proper columns: cloud-sync
+   *   pull cursors and the library list's progress badge query never
+   *   need to parse the JSON blob.
+   *
+   * Sidecar policy:
+   *
+   *   - config.json on disk = `JSON.stringify({...sqlBlob, booknotes:
+   *     [...active+deleted notes from book_notes]})`. WebDAV / backup /
+   *     Foliate import read it unchanged.
+   *   - On first read after upgrade, if the row is missing AND the
+   *     sidecar exists, the repo seeds book_configs + book_notes from
+   *     the sidecar. Idempotent (PK conflict on re-seed is a no-op).
+   *
+   * Indexing rationale:
+   *
+   *   - `idx_book_notes_book_hash_updated` lets the per-book annotation
+   *     panel and the WebDAV note-pull cursor scan one book's notes in
+   *     order without a full scan.
+   *
+   *   - `idx_book_notes_updated_at` (across books, partial on
+   *     deleted_at IS NULL) is what library-wide note search and the
+   *     cloud-sync "give me everything since cursor T" query use. The
+   *     partial predicate keeps the index narrow for the common case
+   *     and lets tombstone-aware queries fall back to the wider scan.
+   *
+   *   - `idx_book_configs_synced_notes` mirrors books.idx_books_synced_at
+   *     for the notes-side cursor (last_synced_at_notes), the column
+   *     the WebDAV/cloud sync poller actually compares against.
+   */
+  {
+    name: '2026053002_book_configs_and_notes',
+    sql: `
+      CREATE TABLE IF NOT EXISTS book_configs (
+        book_hash TEXT PRIMARY KEY,
+        schema_version INTEGER,
+        progress_current INTEGER,
+        progress_total INTEGER,
+        location TEXT,
+        xpointer TEXT,
+        config_json TEXT NOT NULL,
+        last_synced_at_config INTEGER,
+        last_synced_at_notes INTEGER,
+        last_pushed_at_config INTEGER,
+        last_pushed_at_notes INTEGER,
+        foliate_imported_at INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_book_configs_synced_notes
+      ON book_configs (last_synced_at_notes)
+      WHERE last_synced_at_notes IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS book_notes (
+        book_hash TEXT NOT NULL,
+        id TEXT NOT NULL,
+        meta_hash TEXT,
+        type TEXT NOT NULL,
+        cfi TEXT NOT NULL,
+        xpointer0 TEXT,
+        xpointer1 TEXT,
+        page INTEGER,
+        text TEXT,
+        style TEXT,
+        color TEXT,
+        note TEXT NOT NULL,
+        global_flag INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER,
+        PRIMARY KEY (book_hash, id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_book_notes_book_hash_updated
+      ON book_notes (book_hash, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_book_notes_updated_at
+      ON book_notes (updated_at DESC)
+      WHERE deleted_at IS NULL;
     `,
   },
 ];

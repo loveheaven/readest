@@ -7,7 +7,8 @@
  * cover-rehydration path without spinning up a real Turso engine.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Book } from '@/types/book';
+import type { Book, BookConfig, BookNote } from '@/types/book';
+import type { SystemSettings } from '@/types/settings';
 import type { AppService, BaseDir, FileSystem, FileItem, FileInfo } from '@/types/system';
 import { SqliteLibraryRepository } from '@/services/library';
 
@@ -46,9 +47,47 @@ interface ProgressRow {
   updated_at: number;
 }
 
+interface ConfigRow {
+  book_hash: string;
+  schema_version: number | null;
+  progress_current: number | null;
+  progress_total: number | null;
+  location: string | null;
+  xpointer: string | null;
+  config_json: string;
+  last_synced_at_config: number | null;
+  last_synced_at_notes: number | null;
+  last_pushed_at_config: number | null;
+  last_pushed_at_notes: number | null;
+  foliate_imported_at: number | null;
+  updated_at: number;
+}
+
+interface NoteRow {
+  book_hash: string;
+  id: string;
+  meta_hash: string | null;
+  type: string;
+  cfi: string;
+  xpointer0: string | null;
+  xpointer1: string | null;
+  page: number | null;
+  text: string | null;
+  style: string | null;
+  color: string | null;
+  note: string;
+  global_flag: number | null;
+  created_at: number;
+  updated_at: number;
+  deleted_at: number | null;
+}
+
 class MockDb {
   books = new Map<string, BooksRow>();
   progress = new Map<string, ProgressRow>();
+  configs = new Map<string, ConfigRow>();
+  // notes keyed by `${book_hash}::${id}` to model the composite PK.
+  notes = new Map<string, NoteRow>();
   closed = false;
 
   // --- helpers -----------------------------------------------------------
@@ -99,7 +138,17 @@ class MockDb {
       const rows = Array.from(this.books.values()).sort((a, b) => b.updated_at - a.updated_at);
       return rows;
     }
-    void params;
+    if (sql.includes('SELECT * FROM book_configs')) {
+      const [bookHash] = params as [string];
+      const row = this.configs.get(bookHash);
+      return row ? [row] : [];
+    }
+    if (sql.includes('SELECT * FROM book_notes')) {
+      const [bookHash] = params as [string];
+      return Array.from(this.notes.values())
+        .filter((n) => n.book_hash === bookHash)
+        .sort((a, b) => b.updated_at - a.updated_at);
+    }
     throw new Error(`MockDb.select: unhandled SQL: ${sql}`);
   });
 
@@ -118,6 +167,58 @@ class MockDb {
       const [hash] = params as [string];
       this.progress.delete(hash);
       return { rowsAffected: 1, lastInsertId: 0 };
+    }
+    if (sql.includes('INSERT INTO book_configs')) {
+      const row: ConfigRow = {
+        book_hash: params[0] as string,
+        schema_version: params[1] as number | null,
+        progress_current: params[2] as number | null,
+        progress_total: params[3] as number | null,
+        location: params[4] as string | null,
+        xpointer: params[5] as string | null,
+        config_json: params[6] as string,
+        last_synced_at_config: params[7] as number | null,
+        last_synced_at_notes: params[8] as number | null,
+        last_pushed_at_config: params[9] as number | null,
+        last_pushed_at_notes: params[10] as number | null,
+        foliate_imported_at: params[11] as number | null,
+        updated_at: params[12] as number,
+      };
+      this.configs.set(row.book_hash, row);
+      return { rowsAffected: 1, lastInsertId: 0 };
+    }
+    if (sql.includes('INSERT INTO book_notes')) {
+      const row: NoteRow = {
+        book_hash: params[0] as string,
+        id: params[1] as string,
+        meta_hash: params[2] as string | null,
+        type: params[3] as string,
+        cfi: params[4] as string,
+        xpointer0: params[5] as string | null,
+        xpointer1: params[6] as string | null,
+        page: params[7] as number | null,
+        text: params[8] as string | null,
+        style: params[9] as string | null,
+        color: params[10] as string | null,
+        note: params[11] as string,
+        global_flag: params[12] as number | null,
+        created_at: params[13] as number,
+        updated_at: params[14] as number,
+        deleted_at: params[15] as number | null,
+      };
+      this.notes.set(`${row.book_hash}::${row.id}`, row);
+      return { rowsAffected: 1, lastInsertId: 0 };
+    }
+    if (sql.includes('DELETE FROM book_notes WHERE book_hash = ?')) {
+      const [hash] = params as [string];
+      let removed = 0;
+      for (const k of Array.from(this.notes.keys())) {
+        if (k.startsWith(`${hash}::`)) {
+          this.notes.delete(k);
+          removed += 1;
+        }
+      }
+      return { rowsAffected: removed, lastInsertId: 0 };
     }
     if (sql.includes('DELETE FROM books')) {
       const [hash] = params as [string];
@@ -190,8 +291,9 @@ class MockFs implements Partial<FileSystem> {
     return content;
   });
 
-  writeFile = vi.fn(async () => {
-    /* no-op for tests that don't touch JSON config */
+  writeFile = vi.fn(async (path: string, base: BaseDir, content: string | Uint8Array) => {
+    if (typeof content !== 'string') return;
+    this.files.set(`${base}/${path}`, content);
   });
 
   createDir = vi.fn(async () => {});
@@ -390,5 +492,165 @@ describe('SqliteLibraryRepository', () => {
     const [book] = await repo.loadLibraryBooks();
     expect(book?.tags).toEqual(['fiction', 'classic']);
     expect(book?.metadata).toEqual(meta);
+  });
+
+  // -------------------------------------------------------------------------
+  // BookConfig + BookNotes
+  //
+  // Same MockDb / MockFs as above. The settings stub only needs
+  // `globalViewSettings` populated for the (de)serialiser to round-trip
+  // viewSettings overrides; everything else on SystemSettings is unused
+  // by the repo.
+  // -------------------------------------------------------------------------
+
+  const makeSettings = (
+    overrides: Partial<SystemSettings['globalViewSettings']> = {},
+  ): SystemSettings =>
+    ({
+      globalViewSettings: {
+        // Only the fields we exercise in the diff/compress path need
+        // to exist; everything else `serializeConfig` reads is
+        // tolerated as "missing -> not in diff".
+        scrolled: false,
+        gapPercent: 5,
+        ...overrides,
+      },
+    }) as unknown as SystemSettings;
+
+  const makeNote = (overrides: Partial<BookNote> & Pick<BookNote, 'id'>): BookNote => ({
+    type: 'highlight',
+    cfi: `epubcfi(/${overrides.id})`,
+    note: '',
+    createdAt: 1000,
+    updatedAt: 2000,
+    ...overrides,
+  });
+
+  it('loadBookConfig returns the empty default when neither row nor sidecar exist', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const config = await repo.loadBookConfig(book, makeSettings());
+
+    expect(config.booknotes).toBeUndefined();
+    expect(config.viewSettings?.scrolled).toBe(false); // rehydrated from globals
+  });
+
+  it('saveBookConfig writes the SQLite row and a byte-identical sidecar', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const config: BookConfig = {
+      schemaVersion: 1,
+      progress: [3, 100],
+      location: 'epubcfi(/6/4)',
+      updatedAt: 1234,
+      viewSettings: { scrolled: true } as BookConfig['viewSettings'],
+      booknotes: [makeNote({ id: 'n1', text: 'hi', note: 'why?' })],
+    };
+
+    await repo.saveBookConfig(book, config, makeSettings());
+
+    // SQLite row reflects the hot-path columns.
+    const row = db.configs.get('h1');
+    expect(row?.progress_current).toBe(3);
+    expect(row?.progress_total).toBe(100);
+    expect(row?.location).toBe('epubcfi(/6/4)');
+    expect(row?.updated_at).toBe(1234);
+
+    // config_json never inlines booknotes — those go to book_notes.
+    const persisted = JSON.parse(row!.config_json) as BookConfig;
+    expect(persisted.booknotes).toBeUndefined();
+    // The diff-compressed viewSettings only carries non-default fields.
+    expect(persisted.viewSettings?.scrolled).toBe(true);
+    expect(persisted.viewSettings?.gapPercent).toBeUndefined();
+
+    // Booknote row exists with global_flag normalised.
+    expect(db.notes.get('h1::n1')?.note).toBe('why?');
+    expect(db.notes.get('h1::n1')?.global_flag).toBe(0);
+
+    // Sidecar mirror: the on-disk file embeds booknotes inline so
+    // backup / WebDAV consumers see no behaviour change.
+    const sidecar = JSON.parse(fs.files.get('Books/h1/config.json')!) as BookConfig;
+    expect(sidecar.booknotes).toHaveLength(1);
+    expect(sidecar.booknotes![0]!.id).toBe('n1');
+    expect(sidecar.viewSettings?.scrolled).toBe(true);
+  });
+
+  it('loadBookConfig re-attaches booknotes from book_notes', async () => {
+    const book = makeBook({ hash: 'h1' });
+    await repo.saveBookConfig(
+      book,
+      {
+        updatedAt: 1,
+        booknotes: [makeNote({ id: 'n1', updatedAt: 100 }), makeNote({ id: 'n2', updatedAt: 200 })],
+      } as BookConfig,
+      makeSettings(),
+    );
+
+    const loaded = await repo.loadBookConfig(book, makeSettings());
+
+    // ORDER BY updated_at DESC.
+    expect(loaded.booknotes?.map((n) => n.id)).toEqual(['n2', 'n1']);
+  });
+
+  it('saveBookConfig replaces the booknotes set so deletions take effect', async () => {
+    const book = makeBook({ hash: 'h1' });
+    await repo.saveBookConfig(
+      book,
+      { updatedAt: 1, booknotes: [makeNote({ id: 'n1' }), makeNote({ id: 'n2' })] } as BookConfig,
+      makeSettings(),
+    );
+
+    await repo.saveBookConfig(
+      book,
+      { updatedAt: 2, booknotes: [makeNote({ id: 'n2' })] } as BookConfig,
+      makeSettings(),
+    );
+
+    expect(db.notes.has('h1::n1')).toBe(false);
+    expect(db.notes.has('h1::n2')).toBe(true);
+  });
+
+  it('saveBookConfig without settings emits a raw (uncompressed) payload', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const config: BookConfig = {
+      updatedAt: 1,
+      // viewSettings.gapPercent matches the global default — when settings
+      // are present this would be diffed away; in raw mode it stays.
+      viewSettings: { gapPercent: 5, scrolled: false } as BookConfig['viewSettings'],
+    };
+    await repo.saveBookConfig(book, config);
+
+    const row = db.configs.get('h1');
+    const persisted = JSON.parse(row!.config_json) as BookConfig;
+    // No diff: both fields survive.
+    expect(persisted.viewSettings?.gapPercent).toBe(5);
+    expect(persisted.viewSettings?.scrolled).toBe(false);
+  });
+
+  it('loadBookConfig bootstraps from legacy sidecar when row is missing', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const legacy: BookConfig = {
+      updatedAt: 999,
+      progress: [10, 50],
+      booknotes: [makeNote({ id: 'legacy', text: 'old' })],
+    } as BookConfig;
+    fs.files.set('Books/h1/config.json', JSON.stringify(legacy));
+
+    const loaded = await repo.loadBookConfig(book, makeSettings());
+
+    expect(loaded.progress).toEqual([10, 50]);
+    expect(loaded.booknotes?.[0]?.id).toBe('legacy');
+    // Bootstrap is observable — the row exists now.
+    expect(db.configs.get('h1')?.progress_current).toBe(10);
+    expect(db.notes.get('h1::legacy')).toBeDefined();
+  });
+
+  it('bootstrap ignores corrupt sidecars instead of crashing', async () => {
+    const book = makeBook({ hash: 'h1' });
+    fs.files.set('Books/h1/config.json', '{not json');
+
+    const loaded = await repo.loadBookConfig(book, makeSettings());
+
+    // Falls back to the empty default; no row inserted.
+    expect(loaded.booknotes).toBeUndefined();
+    expect(db.configs.has('h1')).toBe(false);
   });
 });
