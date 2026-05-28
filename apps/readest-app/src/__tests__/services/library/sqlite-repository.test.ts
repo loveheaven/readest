@@ -82,12 +82,21 @@ interface NoteRow {
   deleted_at: number | null;
 }
 
+interface NavRow {
+  book_hash: string;
+  version: number;
+  toc_json: string;
+  sections_json: string;
+  updated_at: number;
+}
+
 class MockDb {
   books = new Map<string, BooksRow>();
   progress = new Map<string, ProgressRow>();
   configs = new Map<string, ConfigRow>();
   // notes keyed by `${book_hash}::${id}` to model the composite PK.
   notes = new Map<string, NoteRow>();
+  navs = new Map<string, NavRow>();
   closed = false;
 
   // --- helpers -----------------------------------------------------------
@@ -148,6 +157,11 @@ class MockDb {
       return Array.from(this.notes.values())
         .filter((n) => n.book_hash === bookHash)
         .sort((a, b) => b.updated_at - a.updated_at);
+    }
+    if (sql.includes('SELECT * FROM book_navs')) {
+      const [bookHash] = params as [string];
+      const row = this.navs.get(bookHash);
+      return row ? [row] : [];
     }
     throw new Error(`MockDb.select: unhandled SQL: ${sql}`);
   });
@@ -219,6 +233,17 @@ class MockDb {
         }
       }
       return { rowsAffected: removed, lastInsertId: 0 };
+    }
+    if (sql.includes('INSERT INTO book_navs')) {
+      const row: NavRow = {
+        book_hash: params[0] as string,
+        version: params[1] as number,
+        toc_json: params[2] as string,
+        sections_json: params[3] as string,
+        updated_at: params[4] as number,
+      };
+      this.navs.set(row.book_hash, row);
+      return { rowsAffected: 1, lastInsertId: 0 };
     }
     if (sql.includes('DELETE FROM books')) {
       const [hash] = params as [string];
@@ -652,5 +677,110 @@ describe('SqliteLibraryRepository', () => {
     // Falls back to the empty default; no row inserted.
     expect(loaded.booknotes).toBeUndefined();
     expect(db.configs.has('h1')).toBe(false);
+  });
+});
+
+describe('SqliteLibraryRepository — BookNav', () => {
+  let db: MockDb;
+  let fs: MockFs;
+  let repo: SqliteLibraryRepository;
+
+  beforeEach(() => {
+    db = new MockDb();
+    fs = new MockFs();
+    repo = new SqliteLibraryRepository(
+      appServiceFor(db),
+      fs as unknown as FileSystem,
+      async () => 'cover://',
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Mirrors the `BookNav` shape from @/services/nav. We avoid pulling the
+  // real type to keep this test independent of the nav-module surface.
+  const makeNav = (overrides: Partial<{ version: number }> = {}) => ({
+    version: 3,
+    toc: [{ label: 'Chapter 1', href: 'c1.xhtml' }],
+    sections: { 'c1.xhtml': { id: 'c1.xhtml', fragments: [] } },
+    ...overrides,
+  });
+
+  it('returns null when no nav row and no sidecar exist', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const got = await repo.loadBookNav(book);
+    expect(got).toBeNull();
+    expect(db.navs.size).toBe(0);
+  });
+
+  it('saveBookNav writes the SQLite row and a byte-identical sidecar', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const nav = makeNav();
+
+    await repo.saveBookNav(book, nav);
+
+    const row = db.navs.get('h1');
+    expect(row).toBeDefined();
+    expect(row!.version).toBe(3);
+    expect(JSON.parse(row!.toc_json)).toEqual(nav.toc);
+    expect(JSON.parse(row!.sections_json)).toEqual(nav.sections);
+
+    const sidecar = fs.files.get('Books/h1/nav.json');
+    expect(sidecar).toBe(JSON.stringify(nav));
+  });
+
+  it('loadBookNav reads from SQLite when the row exists', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const nav = makeNav({ version: 3 });
+    await repo.saveBookNav(book, nav);
+
+    const loaded = await repo.loadBookNav(book);
+    expect(loaded).toEqual(nav);
+  });
+
+  it('loadBookNav bootstraps from a legacy nav.json sidecar on first read', async () => {
+    const book = makeBook({ hash: 'h1' });
+    const legacy = makeNav({ version: 2 });
+    fs.files.set('Books/h1/nav.json', JSON.stringify(legacy));
+
+    const loaded = await repo.loadBookNav(book);
+
+    expect(loaded).toEqual(legacy);
+    // Seed is observable: the row exists now and a subsequent load
+    // would skip the sidecar entirely.
+    expect(db.navs.get('h1')?.version).toBe(2);
+  });
+
+  it('loadBookNav returns null for corrupt sidecars (computeBookNav rebuilds)', async () => {
+    const book = makeBook({ hash: 'h1' });
+    fs.files.set('Books/h1/nav.json', '{not json');
+
+    const loaded = await repo.loadBookNav(book);
+    expect(loaded).toBeNull();
+    expect(db.navs.has('h1')).toBe(false);
+  });
+
+  it('loadBookNav returns null when the parsed payload lacks a version', async () => {
+    const book = makeBook({ hash: 'h1' });
+    // Valid JSON, wrong shape — matches the existing JSON repo guard
+    // (`typeof parsed.version !== 'number'`) so the reader still
+    // recomputes the nav from scratch.
+    fs.files.set('Books/h1/nav.json', JSON.stringify({ toc: [], sections: {} }));
+
+    const loaded = await repo.loadBookNav(book);
+    expect(loaded).toBeNull();
+    expect(db.navs.has('h1')).toBe(false);
+  });
+
+  it('saveBookNav overwrites a previous row and sidecar', async () => {
+    const book = makeBook({ hash: 'h1' });
+    await repo.saveBookNav(book, makeNav({ version: 2 }));
+    await repo.saveBookNav(book, makeNav({ version: 3 }));
+
+    expect(db.navs.get('h1')?.version).toBe(3);
+    const sidecar = JSON.parse(fs.files.get('Books/h1/nav.json')!) as { version: number };
+    expect(sidecar.version).toBe(3);
   });
 });

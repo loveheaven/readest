@@ -35,10 +35,13 @@ import { MigrationEntry } from '../migrate';
  *     mergeBooks dedup all read it directly), but SQLite becomes the
  *     source of truth. See that migration's preamble for design notes.
  *
- *   - book_navs                — Books/<hash>/nav.json idem. Reserved
- *                                for the next commit; the cache rebuild
- *                                cost is per-open and behaves the same
- *                                whether SQLite or JSON owns it.
+ *   - v3 (2026053003_book_navs) — book_navs. Books/<hash>/nav.json moves
+ *     to a SQLite row keyed by hash, with toc / sections kept as JSON
+ *     blobs. The on-disk nav.json sidecar is still written byte-identically
+ *     so external tooling and the legacy fallback continue to operate.
+ *     Nav is a derived cache (computeBookNav rebuilds it on miss), so the
+ *     migration value is structural consistency with config storage rather
+ *     than I/O speed.
  *
  * Indexing rationale:
  *
@@ -232,6 +235,38 @@ export const libraryMigrations: MigrationEntry[] = [
       CREATE INDEX IF NOT EXISTS idx_book_notes_updated_at
       ON book_notes (updated_at DESC)
       WHERE deleted_at IS NULL;
+    `,
+  },
+
+  /**
+   * v3 — book_navs.
+   *
+   * BookNav is a derived cache (TOC + per-section fragment offsets) that
+   * the reader rebuilds on miss via computeBookNav, so this migration is
+   * not about I/O speedup — it is about ending the per-book sidecar
+   * sprawl and giving sync / housekeeping queries a single table to
+   * reason about. `version` lives as its own column so the existing
+   * "stale cache" check (`cachedNav.version === BOOK_NAV_VERSION`) does
+   * not have to parse the JSON body on every open. `toc_json` and
+   * `sections_json` stay opaque because their shape evolves with the
+   * nav algorithm (BOOK_NAV_VERSION bumps) and a relational layout
+   * would force a schema migration on every algorithm change.
+   *
+   * Sidecar policy mirrors v2: SQLite is canonical, but every save
+   * also writes a byte-identical Books/<hash>/nav.json so external
+   * tooling and the JsonLibraryRepository fallback keep working. On
+   * first read after upgrade, missing rows are seeded from the sidecar.
+   */
+  {
+    name: '2026053003_book_navs',
+    sql: `
+      CREATE TABLE IF NOT EXISTS book_navs (
+        book_hash TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        toc_json TEXT NOT NULL,
+        sections_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `,
   },
 ];

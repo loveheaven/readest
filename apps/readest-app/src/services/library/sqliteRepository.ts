@@ -8,12 +8,11 @@ import {
   DEFAULT_BOOK_SEARCH_CONFIG,
   DEFAULT_FIXED_LAYOUT_VIEW_SETTINGS,
 } from '@/services/constants';
-import { getConfigFilename } from '@/utils/book';
+import { getBookNavFilename, getConfigFilename } from '@/utils/book';
 import { deserializeConfig, serializeConfig, serializeRawConfig } from '@/utils/serializer';
 
 import * as LibrarySvc from '@/services/libraryService';
 
-import { JsonLibraryRepository } from './jsonRepository';
 import type { LibraryRepository } from './types';
 
 const DB_SCHEMA = 'library';
@@ -208,6 +207,46 @@ const UPSERT_NOTE_SQL = `
 
 const DELETE_NOTES_FOR_BOOK_SQL = `DELETE FROM book_notes WHERE book_hash = ?`;
 
+// ---------------------------------------------------------------------------
+// book_navs (one row per book) — derived TOC + section fragment cache
+// ---------------------------------------------------------------------------
+
+interface BookNavRow extends DatabaseRow {
+  book_hash: string;
+  version: number;
+  toc_json: string;
+  sections_json: string;
+  updated_at: number;
+}
+
+const UPSERT_NAV_SQL = `
+  INSERT INTO book_navs (
+    book_hash, version, toc_json, sections_json, updated_at
+  ) VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(book_hash) DO UPDATE SET
+    version       = excluded.version,
+    toc_json      = excluded.toc_json,
+    sections_json = excluded.sections_json,
+    updated_at    = excluded.updated_at
+`;
+
+function navToParams(bookHash: string, nav: BookNav, now: number): unknown[] {
+  return [bookHash, nav.version, JSON.stringify(nav.toc), JSON.stringify(nav.sections), now];
+}
+
+function rowToNav(row: BookNavRow): BookNav | null {
+  try {
+    const toc = JSON.parse(row.toc_json) as BookNav['toc'];
+    const sections = JSON.parse(row.sections_json) as BookNav['sections'];
+    return { version: row.version, toc, sections };
+  } catch {
+    // A corrupt row is indistinguishable from a missing one for callers —
+    // computeBookNav will rebuild on miss, and the next saveBookNav will
+    // overwrite with a clean blob.
+    return null;
+  }
+}
+
 /**
  * Strip booknotes from the config payload before serialising into the
  * `config_json` column. Booknotes live in their own table; embedding
@@ -384,9 +423,11 @@ function rowToBook(row: BookRow): Book {
  *     for hot reads/writes. The on-disk sidecar config.json is still
  *     written byte-identically on every save so backupService, WebDAVSync
  *     and importBook's mergeBooks dedup path keep working unchanged.
- *   - Books/<hash>/nav.json is still on disk (handled by the legacy
- *     JsonLibraryRepository for {load,save}BookNav). A follow-up commit
- *     moves nav into SQLite using the same sidecar-mirroring pattern.
+ *   - book_navs replaces Books/<hash>/nav.json. Nav is a derived cache
+ *     (computeBookNav rebuilds on miss), so this is structural rather
+ *     than performance-driven; the sidecar nav.json is still mirrored
+ *     on save for parity with the config path and to keep the on-disk
+ *     library inspectable / portable.
  *
  * Why keep sidecars?
  *   - backupService.exportLibrary scans zip entries for `<hash>/config.json`
@@ -407,6 +448,9 @@ function rowToBook(row: BookRow): Book {
  *     loadBookConfig() — reads the legacy sidecar, INSERTs config + notes
  *     in one transaction. Brand-new books with no sidecar yet return
  *     the empty default config (matches JSON backend behaviour).
+ *   - book_navs: lazy bootstrap per-book on first loadBookNav(). A miss
+ *     returns null (matching the JSON backend), which the reader
+ *     interprets as "rebuild via computeBookNav".
  *
  *   This means existing installs upgrade transparently without any
  *   blocking migration step on launch.
@@ -415,19 +459,11 @@ export class SqliteLibraryRepository implements LibraryRepository {
   /** True once we've successfully verified / seeded the books table. */
   private bootstrapped = false;
 
-  /**
-   * Legacy JSON backend, retained ONLY for {load,save}BookNav until the
-   * follow-up commit migrates nav.json. Once that lands this field
-   * disappears entirely.
-   */
-  private readonly jsonNavRepo: JsonLibraryRepository;
-
   constructor(
     private readonly appService: Pick<AppService, 'openDatabase'>,
     private readonly fs: FileSystem,
     private readonly generateCoverImageUrl: (book: Book) => Promise<string>,
   ) {
-    this.jsonNavRepo = new JsonLibraryRepository(fs, generateCoverImageUrl);
     // NOTE: we deliberately do NOT capture a resolvePath here. openDatabase
     // resolves DB_PATH relative to DB_BASE on every open via the platform's
     // DatabaseService implementation, which already honours
@@ -759,16 +795,60 @@ export class SqliteLibraryRepository implements LibraryRepository {
   }
 
   // -------------------------------------------------------------------------
-  // BookNav still routes through the file-based backend for now. Migrating
-  // nav.json into SQLite is a deliberate follow-up commit (see migrations
-  // v3 placeholder reservation in services/database/migrations/library.ts).
+  // BookNav (book_navs) — derived TOC cache, SQLite-canonical with sidecar
   // -------------------------------------------------------------------------
 
-  loadBookNav(book: Book): Promise<BookNav | null> {
-    return this.jsonNavRepo.loadBookNav(book);
+  async loadBookNav(book: Book): Promise<BookNav | null> {
+    return this.withDb(async (db) => {
+      const rows = await db.select<BookNavRow>(
+        'SELECT * FROM book_navs WHERE book_hash = ? LIMIT 1',
+        [book.hash],
+      );
+      const row = rows[0];
+      if (row) return rowToNav(row);
+      // Lazy bootstrap from a legacy sidecar so existing installs keep
+      // their cached nav across upgrade. A miss is the steady-state
+      // signal — the reader will rebuild via computeBookNav.
+      return this.bootstrapBookNavFromSidecar(db, book);
+    });
   }
 
-  saveBookNav(book: Book, nav: BookNav): Promise<void> {
-    return this.jsonNavRepo.saveBookNav(book, nav);
+  async saveBookNav(book: Book, nav: BookNav): Promise<void> {
+    // SQLite is canonical, but mirror to the on-disk sidecar so external
+    // tooling and a hypothetical fallback to JsonLibraryRepository keep
+    // working. JSON.stringify(nav) here matches the legacy bookService
+    // saveBookNav byte-for-byte.
+    const sidecar = JSON.stringify(nav);
+
+    await this.withDb(async (db) => {
+      await db.execute(UPSERT_NAV_SQL, navToParams(book.hash, nav, Date.now()));
+    });
+
+    await this.fs.writeFile(getBookNavFilename(book), 'Books', sidecar);
+  }
+
+  /**
+   * Read Books/<hash>/nav.json (if present) and seed book_navs so the
+   * next loadBookNav hit goes straight to SQLite. Corrupt / unreadable
+   * sidecars degrade silently to "no cache" — the reader will recompute.
+   */
+  private async bootstrapBookNavFromSidecar(
+    db: DatabaseService,
+    book: Book,
+  ): Promise<BookNav | null> {
+    const path = getBookNavFilename(book);
+    if (!(await this.fs.exists(path, 'Books'))) return null;
+
+    let parsed: BookNav;
+    try {
+      const str = (await this.fs.readFile(path, 'Books', 'text')) as string;
+      parsed = JSON.parse(str) as BookNav;
+    } catch {
+      return null;
+    }
+    if (!parsed || typeof parsed.version !== 'number') return null;
+
+    await db.execute(UPSERT_NAV_SQL, navToParams(book.hash, parsed, Date.now()));
+    return parsed;
   }
 }
