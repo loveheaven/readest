@@ -1,4 +1,5 @@
 import { MigrationEntry, SchemaType } from '../migrate';
+import { libraryMigrations } from './library';
 
 /**
  * Migration definitions for each schema type.
@@ -13,6 +14,7 @@ import { MigrationEntry, SchemaType } from '../migrate';
  *   2. Add a new key here with its migration array.
  */
 const migrations: Record<SchemaType, MigrationEntry[]> = {
+  library: libraryMigrations,
   opds: [
     {
       name: '2026052701_opds_source_mappings',

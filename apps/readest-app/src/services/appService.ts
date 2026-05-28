@@ -29,8 +29,8 @@ import * as CloudSvc from './cloudService';
 import * as DictSvc from './dictionaries/dictionaryService';
 import * as FontSvc from './fontService';
 import * as ImageSvc from './imageService';
-import * as LibrarySvc from './libraryService';
 import * as Settings from './settingsService';
+import { JsonLibraryRepository, LibraryRepository } from './library';
 
 export abstract class BaseAppService implements AppService {
   osPlatform: OsPlatform = getOSPlatform();
@@ -70,6 +70,32 @@ export abstract class BaseAppService implements AppService {
 
   protected abstract fs: FileSystem;
   protected abstract resolvePath(fp: string, base: BaseDir): ResolvedPath;
+
+  /**
+   * Library persistence backend. Lazily instantiated on first access so
+   * subclasses' `fs` field is guaranteed to be initialised before we
+   * capture it (subclass field initialisers run AFTER super()). The
+   * default backend wraps the legacy on-disk JSON storage; subclasses
+   * may override `createLibraryRepository()` to swap in a SQLite-backed
+   * implementation (planned: Tauri / Node use SQLite by default;
+   * the Web build keeps JSON until a turso-wasm shim ships).
+   */
+  private _libraryRepo: LibraryRepository | null = null;
+  protected get libraryRepo(): LibraryRepository {
+    if (!this._libraryRepo) {
+      this._libraryRepo = this.createLibraryRepository();
+    }
+    return this._libraryRepo;
+  }
+
+  /**
+   * Hook for subclasses to provide an alternative LibraryRepository.
+   * The default returns a JsonLibraryRepository that preserves the
+   * existing on-disk layout (Books/library.json + Books/<hash>/{config,nav}.json).
+   */
+  protected createLibraryRepository(): LibraryRepository {
+    return new JsonLibraryRepository(this.fs, this.generateCoverImageUrl.bind(this));
+  }
 
   abstract init(): Promise<void>;
   abstract setCustomRootDir(customRootDir: string): Promise<void>;
@@ -390,7 +416,7 @@ export abstract class BaseAppService implements AppService {
   }
 
   async loadBookConfig(book: Book, settings: SystemSettings): Promise<BookConfig> {
-    return BookSvc.loadBookConfig(this.fs, book, settings);
+    return this.libraryRepo.loadBookConfig(book, settings);
   }
 
   async fetchBookDetails(book: Book) {
@@ -398,22 +424,22 @@ export abstract class BaseAppService implements AppService {
   }
 
   async saveBookConfig(book: Book, config: BookConfig, settings?: SystemSettings) {
-    return BookSvc.saveBookConfig(this.fs, book, config, settings);
+    return this.libraryRepo.saveBookConfig(book, config, settings);
   }
 
   async loadBookNav(book: Book) {
-    return BookSvc.loadBookNav(this.fs, book);
+    return this.libraryRepo.loadBookNav(book);
   }
 
   async saveBookNav(book: Book, nav: BookNav) {
-    return BookSvc.saveBookNav(this.fs, book, nav);
+    return this.libraryRepo.saveBookNav(book, nav);
   }
 
   async loadLibraryBooks(): Promise<Book[]> {
-    return LibrarySvc.loadLibraryBooks(this.fs, this.generateCoverImageUrl.bind(this));
+    return this.libraryRepo.loadLibraryBooks();
   }
 
   async saveLibraryBooks(books: Book[]): Promise<void> {
-    return LibrarySvc.saveLibraryBooks(this.fs, books);
+    return this.libraryRepo.saveLibraryBooks(books);
   }
 }

@@ -44,6 +44,7 @@ import { copyFiles } from '@/utils/files';
 import { BaseAppService } from './appService';
 import { DatabaseOpts, DatabaseService } from '@/types/database';
 import { SchemaType } from '@/services/database/migrate';
+import { LibraryRepository, SqliteLibraryRepository } from './library';
 import {
   DATA_SUBDIR,
   LOCAL_BOOKS_SUBDIR,
@@ -555,6 +556,18 @@ export class NativeAppService extends BaseAppService {
 
   override resolvePath(fp: string, base: BaseDir): ResolvedPath {
     return this.fs.resolvePath(fp, base);
+  }
+
+  /**
+   * Tauri builds get the SQLite-backed library backend. The bench at
+   * apps/readest-app/bench/library-storage measured ~83× progress-update
+   * speedup and ~19× batch-import speedup vs the legacy library.json
+   * write path on M1 Pro. config.json / nav.json keep going through the
+   * file-based JsonLibraryRepository inside SqliteLibraryRepository so
+   * backups, WebDAV sync and Foliate import keep working unchanged.
+   */
+  protected override createLibraryRepository(): LibraryRepository {
+    return new SqliteLibraryRepository(this, this.fs, this.generateCoverImageUrl.bind(this));
   }
 
   async setCustomRootDir(customRootDir: string) {

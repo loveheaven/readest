@@ -8,6 +8,7 @@ import { FileSystem, BaseDir, OsPlatform, ResolvedPath, FileItem, FileInfo } fro
 import { DatabaseOpts, DatabaseService } from '@/types/database';
 import { SchemaType } from '@/services/database/migrate';
 import { BaseAppService } from './appService';
+import { LibraryRepository, SqliteLibraryRepository } from './library';
 import {
   DATA_SUBDIR,
   LOCAL_BOOKS_SUBDIR,
@@ -365,6 +366,17 @@ export class NodeAppService extends BaseAppService {
 
   protected resolvePath(fp: string, base: BaseDir): ResolvedPath {
     return this.fs.resolvePath(fp, base);
+  }
+
+  /**
+   * The Node backend is currently used by the bench harness and the CLI
+   * server build — both of them benefit from the same SQLite write
+   * amplification reduction the Tauri build gets, and both ship the
+   * same `@tursodatabase/database` runtime. config/nav stay on disk
+   * (delegated to JsonLibraryRepository inside SqliteLibraryRepository).
+   */
+  protected override createLibraryRepository(): LibraryRepository {
+    return new SqliteLibraryRepository(this, this.fs, this.generateCoverImageUrl.bind(this));
   }
 
   async init(): Promise<void> {
