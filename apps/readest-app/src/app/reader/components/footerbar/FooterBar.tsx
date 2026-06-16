@@ -44,6 +44,16 @@ const FooterBar: React.FC<FooterBarProps> = ({
   const actionTab = hoveredBookKey === bookKey ? userSelectedTab : '';
   const isVisible = hoveredBookKey === bookKey;
 
+  // eslint-disable-next-line no-console
+  console.log('[FB-DBG] FooterBar render', {
+    t: Date.now() % 100000,
+    bookKey,
+    hoveredBookKey,
+    isVisible,
+    userSelectedTab,
+    actionTab,
+  });
+
   const docs = view?.renderer.getContents() ?? [];
   const pointerInDoc = docs.some(({ doc }) => doc?.body?.style.cursor === 'pointer');
 

@@ -295,11 +295,38 @@ export const useTouchEvent = (bookKey: string) => {
           !viewSettings!.vertical &&
           (!bookData.isFixedLayout || viewSettings.zoomLevel <= 100)
         ) {
+          // eslint-disable-next-line no-console
+          console.log('[FB-DBG] onTouchEnd swipe-up toggle', {
+            t: Date.now() % 100000,
+            closure_hovered: hoveredBookKey,
+            store_hovered: useReaderStore.getState().hoveredBookKey,
+            bookKey,
+            setting_to: hoveredBookKey ? null : bookKey,
+          });
           setHoveredBookKey(hoveredBookKey ? null : bookKey);
         }
       } else {
         if (hoveredBookKey) {
+          // eslint-disable-next-line no-console
+          console.log('[FB-DBG] onTouchEnd tap-close', {
+            t: Date.now() % 100000,
+            closure_hovered: hoveredBookKey,
+            store_hovered: useReaderStore.getState().hoveredBookKey,
+            bookKey,
+            deltaX,
+            deltaY,
+          });
           setHoveredBookKey(null);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log('[FB-DBG] onTouchEnd tap-noop', {
+            t: Date.now() % 100000,
+            closure_hovered: hoveredBookKey,
+            store_hovered: useReaderStore.getState().hoveredBookKey,
+            bookKey,
+            deltaX,
+            deltaY,
+          });
         }
       }
     }

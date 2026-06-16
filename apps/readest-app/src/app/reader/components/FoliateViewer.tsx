@@ -185,6 +185,17 @@ const FoliateViewer: React.FC<{
     const { current, next, total } = detail.location as PageInfo;
     const currentPage = atEnd && total > 0 ? total - 1 : current;
     const pageInfo = { current: currentPage, next, total };
+    // eslint-disable-next-line no-console
+    console.log('[PG-DBG] commitRelocate', {
+      t: Date.now() % 100000,
+      bookKey,
+      atEnd,
+      raw_current: current,
+      raw_next: next,
+      raw_total: total,
+      committed_current: currentPage,
+      cfi: detail.cfi,
+    });
     setProgress(
       bookKey,
       detail.cfi,
@@ -200,7 +211,19 @@ const FoliateViewer: React.FC<{
   const progressRelocateHandler = (event: Event) => {
     // Always stash the latest detail; if another rAF is already pending
     // it'll pick this up and the intermediate states are skipped.
-    pendingRelocateRef.current = event as CustomEvent;
+    const ce = event as CustomEvent;
+    const had = !!pendingRelocateRef.current;
+    pendingRelocateRef.current = ce;
+    // eslint-disable-next-line no-console
+    console.log('[PG-DBG] progressRelocateHandler', {
+      t: Date.now() % 100000,
+      bookKey,
+      had_pending: had,
+      raf_pending: relocateRafRef.current != null,
+      raw_current: ce.detail?.location?.current,
+      raw_next: ce.detail?.location?.next,
+      raw_total: ce.detail?.location?.total,
+    });
     if (relocateRafRef.current != null) return;
     relocateRafRef.current = requestAnimationFrame(commitRelocate);
   };

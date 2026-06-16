@@ -238,6 +238,17 @@ export const usePagination = (
             const viewStartX = windowStartX + viewRect.left;
             const viewCenterX = viewStartX + viewRect.width / 2;
             const consumed = eventDispatcher.dispatchSync('iframe-single-click');
+            // eslint-disable-next-line no-console
+            console.log('[FB-DBG] iframe-single-click received', {
+              t: Date.now() % 100000,
+              closure_hovered: hoveredBookKey,
+              store_hovered: useReaderStore.getState().hoveredBookKey,
+              bookKey,
+              consumed,
+              screenX,
+              centerStartX: viewStartX + viewRect.width * 0.375,
+              centerEndX: viewStartX + viewRect.width * 0.625,
+            });
             if (!consumed) {
               const centerStartX = viewStartX + viewRect.width * 0.375;
               const centerEndX = viewStartX + viewRect.width * 0.625;
@@ -246,11 +257,24 @@ export const usePagination = (
                 (screenX >= centerStartX && screenX <= centerEndX)
               ) {
                 // toggle visibility of the header bar and the footer bar
+                // eslint-disable-next-line no-console
+                console.log('[FB-DBG] single-click center-toggle', {
+                  t: Date.now() % 100000,
+                  closure_hovered: hoveredBookKey,
+                  store_hovered: useReaderStore.getState().hoveredBookKey,
+                  setting_to: hoveredBookKey ? null : bookKey,
+                });
                 setHoveredBookKey(hoveredBookKey ? null : bookKey);
                 return;
               }
 
               if (hoveredBookKey) {
+                // eslint-disable-next-line no-console
+                console.log('[FB-DBG] single-click side-close', {
+                  t: Date.now() % 100000,
+                  closure_hovered: hoveredBookKey,
+                  store_hovered: useReaderStore.getState().hoveredBookKey,
+                });
                 setHoveredBookKey(null);
                 return;
               }
